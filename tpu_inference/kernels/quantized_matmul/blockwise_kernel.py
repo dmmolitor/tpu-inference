@@ -20,6 +20,7 @@ MXU_SIZE = 256
 @jax.jit(static_argnames=[
     "block_size",
     "x_q_dtype",
+    "acc_dtype",
     "tuned_value",
 ])
 def quantized_matmul_kernel(
@@ -29,6 +30,7 @@ def quantized_matmul_kernel(
     w_zp: jax.Array | None = None,  # [n_out]
     block_size: int | None = None,
     x_q_dtype: jnp.dtype | None = None,
+    acc_dtype: jnp.dtype | None = None,
     *,
     tuned_value: TunedValue | None = None,
 ) -> jax.Array:
@@ -102,12 +104,14 @@ def quantized_matmul_kernel(
     # used per batch.
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
-    # TODO(amandaliang): Make this configurable.
-    acc_dtype = jnp.bfloat16
-    if (quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer)
-            # Mixed precision matmuls like int4xfp8 accumulate as float.
-            and jnp.issubdtype(x_q_dtype, jnp.integer)):
-        acc_dtype = jnp.int32
+    if acc_dtype is None:
+      if (quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer)
+              # Mixed precision matmuls like int4xfp8 accumulate as float.
+              and jnp.issubdtype(x_q_dtype, jnp.integer)):
+          acc_dtype = jnp.int32
+      else:
+          acc_dtype = jnp.float32
+
 
     vmem_limit_bytes = util.get_vmem_limit(
         n_batch=n_batch,
@@ -211,7 +215,7 @@ def quantized_matmul_kernel(
             out_specs=pl.BlockSpec((batch_block_size, out_block_size),
                                    lambda b, o, i: (b, o)),
             scratch_shapes=[
-                pltpu.VMEM((batch_block_size, out_block_size), jnp.bfloat16)
+                pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
             ],
             grid=(n_batch, n_out, n_in),
         ),

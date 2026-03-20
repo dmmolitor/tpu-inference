@@ -301,6 +301,57 @@ class QuantizedMatmulKernelTest(jtu.JaxTestCase):
             x_q_dtype=jnp.float8_e4m3fn,
         )
 
+    @parameterized.named_parameters(
+        ("float32_acc", jnp.float32),
+        ("bfloat16_acc", jnp.bfloat16)
+    )
+    def test_quantized_blockwise_matmul_explicit_acc_dtype(self, acc_dtype):
+        block_size = 512
+        dtype = jnp.bfloat16
+        bs=512
+        n_input_features=512
+        n_output_features=512
+        w_q_dtype = jnp.int4
+        x_q_dtype = jnp.float8_e4m3fn
+
+
+        prng_key = jax.random.key(1234)
+        k0, k1 = jax.random.split(prng_key, 2)
+        x = jax.random.uniform(k0, (bs, n_input_features),
+                               dtype=dtype,
+                               minval=0,
+                               maxval=1)
+        w = jax.random.uniform(
+            k1,
+            (n_output_features, n_input_features),
+            dtype=dtype,
+            minval=-1,
+            maxval=1,
+        )
+
+        w_q, w_scale = quantize_tensor(w, w_q_dtype, block_size=block_size)
+        assert w_scale.shape == (n_input_features // block_size, 1,
+                                n_output_features)
+
+        expected = reference_block_quantized_matmul(
+            x, w_q, w_scale, block_size, x_q_dtype)
+
+        output = blockwise_kernel(
+            x,
+            w_q,
+            w_scale,
+            block_size=block_size,
+            x_q_dtype=x_q_dtype,
+            tuned_value=TunedValue(512, 512, 512, 2),
+            acc_dtype=acc_dtype,
+        )
+
+        self.assertAllClose(output,
+                            expected,
+                            rtol=0.2,
+                            atol=0.2,
+                            check_dtypes=True)
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

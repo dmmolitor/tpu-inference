@@ -138,7 +138,7 @@ def xla_quantized_batched_matmul(
 
     if quantize_activation:
         acc_dtype = jnp.float32
-        if jnp.issubdtype(w_q.dtype, jnp.integer):
+        if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
         x_q, x_scale = quantize_tensor(x, w_q.dtype)

@@ -22,6 +22,7 @@ import torch
 import torchax
 from compressed_tensors.compressors.quantized_compressors.pack_quantized import \
     pack_to_int32
+from compressed_tensors.quantization import QuantizationArgs
 from jax.sharding import PartitionSpec
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,

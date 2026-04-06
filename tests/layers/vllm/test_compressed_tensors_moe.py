@@ -15,6 +15,7 @@
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import jax
 import numpy as np
 import pytest
 import torch
@@ -27,10 +28,14 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.model_loader import get_model as vllm_get_model
 
 # yapf: disable
 from tests.layers.common import utils as test_utils
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
+from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
+    VllmCompressedTensorsConfig
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe import (
     VllmCompressedTensorsW4A8Fp8MoEMethod,
     VllmCompressedTensorsW8A8Fp8MoEMethod)
@@ -390,3 +395,33 @@ def test_fused_moe_method_w4a8fp8(mesh, num_tokens, intermediate_size,
                                       renormalize=True,
                                       activation="silu")
         assert np.allclose(result, expected, atol=0.2, rtol=0.05)
+
+
+@pytest.mark.parametrize("mesh", [
+    test_utils.get_spmd_mesh(1),
+    test_utils.get_spmd_mesh(min(4, jax.local_device_count()))
+])
+def test_loading_model(mesh):
+
+    engine_args = EngineArgs(
+        model='nm-testing/Qwen1.5-MoE-A2.7B-Chat-quantized.w4a16',
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    # Add activation quantization since the test checkpoints use w4a16 quant.
+    # override_activation_quant_config(vllm_config, num_bits=8, strategy="token")
+
+    vllm_config.quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    vllm_config.device_config.device = "cpu"
+
+    with set_current_vllm_config(vllm_config):
+        vllm_model = vllm_get_model(vllm_config=vllm_config)
+    layers = test_utils.find_all_layer_type(vllm_model, LinearBase)
+    for layer in layers:
+        assert isinstance(layer.quant_config, VllmCompressedTensorsConfig)
+    #     assert isinstance(layer.quant_method, CompressedTensorsLinearMethod)
+    #     assert isinstance(layer.scheme, VllmCompressedTensorsW4A8Fp8)

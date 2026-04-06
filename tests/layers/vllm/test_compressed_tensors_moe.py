@@ -21,7 +21,6 @@ import torch
 import torchax
 from compressed_tensors.compressors.quantized_compressors.pack_quantized import \
     pack_to_int32
-from compressed_tensors.quantization import QuantizationArgs
 from jax.sharding import PartitionSpec
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
@@ -360,6 +359,10 @@ def test_fused_moe_method_w4a8fp8(mesh, num_tokens, intermediate_size,
 
     initialize_int4_layer_weights(layer, weight_quant, hidden_size=128)
     method.process_weights_after_loading(layer)
+
+    def unquantize_weight_for_ref(weight, scale):
+        return (weight.to(torch.float32) * scale.squeeze(1)).transpose(
+            1, 2).cpu()
 
     seqlen = num_tokens
     with torchax.default_env():

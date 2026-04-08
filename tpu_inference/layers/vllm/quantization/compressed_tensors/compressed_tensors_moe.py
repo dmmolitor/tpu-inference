@@ -19,15 +19,16 @@ from compressed_tensors.quantization import QuantizationArgs
 from jax.sharding import Mesh
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
-from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig
+from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
+                                                  FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
-    CompressedTensorsMoEMethod, CompressedTensorsW4A8Fp8MoEMethod,
-    CompressedTensorsW8A8Fp8MoEMethod)
-from vllm.model_executor.parameter import (BasevLLMParameter,
-                                           ChannelQuantScaleParameter,
-                                           GroupQuantScaleParameter,
-                                           PackedvLLMParameter)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig, int4_w4a16_moe_quant_config)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import \
+    CompressedTensorsMoEMethod  # CompressedTensorsW4A8Fp8MoEMethod,
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import \
+    CompressedTensorsW8A8Fp8MoEMethod  # noqa: E501
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.scalar_type import ScalarType, scalar_types
 
 from tpu_inference.layers.common.moe import MoEBackend
@@ -78,6 +79,10 @@ def jax_unpack_quantized_values_into_int32(
     return jnp.transpose(res, inv_perm)
 
 
+def _is_w4a16(weight_quant, input_quant):
+    return (weight_quant.num_bits == 4 and not input_quant)
+
+
 class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
 
     @staticmethod
@@ -116,6 +121,11 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         if quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return VllmCompressedTensorsW8A8Fp8MoEMethod(
                 weight_quant, input_quant, layer.moe_config, quant_config.mesh)
+        elif _is_w4a16(weight_quant, input_quant):
+            return VllmCompressedTensorsW4A16MoEMethod(weight_quant,
+                                                       input_quant,
+                                                       layer.moe_config,
+                                                       quant_config.mesh)
         elif quant_config._is_fp8_w4a8(weight_quant, input_quant):
             return VllmCompressedTensorsW4A8Fp8MoEMethod(
                 weight_quant, input_quant, layer.moe_config, quant_config.mesh)
@@ -254,10 +264,10 @@ class VllmCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod,
                               router_logits=router_logits)
 
 
-class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
+class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod,
                                             VllmQuantConfig):
     """
-    MoE method for int4xfp8 (INT4 weights, FP8/16 activations) compressed-tensors.
+    MoE method for int4xfp8 (INT4 weights, FP8 activations).
     """
 
     def __init__(
@@ -268,7 +278,7 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
         mesh: jax.sharding.Mesh,
         ep_axis_name: str = "model",
     ):
-        super().__init__(weight_quant, input_quant, moe)
+        super().__init__(moe)
 
         self.mesh = mesh
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
@@ -291,26 +301,16 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
 
         self.disable_expert_map = False
 
-        # from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-        # from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        #     GroupShape,
-        # )
-
-        # self.quant_fp8 = QuantFP8(static=False, group_shape=GroupShape.PER_TOKEN)
-
-        # self.ep_axis_name = ep_axis_name
-
     @property
     def is_monolithic(self) -> bool:
         """Indicates if the MoE operation is monolithic."""
         return True
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
-                       hidden_size: int, intermediate_size: int,
-                       params_dtype: torch.dtype, **kwargs):
+                       hidden_size: int, intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
         """
         Initializes the weights and scales for the FusedMoE layer.
-        This is called during model initialization to allocate tensors.
         Handles packed int4 weights and grouped/channelwise scales.
 
         This method differs from the parent class's create_weights in that it
@@ -325,126 +325,87 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
         :param params_dtype: Data type for parameters like scale and bias.
         :param kwargs: Additional arguments like weight_loader.
         """
-
-        weight_loader = kwargs.get("weight_loader")
+        # TODO: See whether these args can just use the layer vals.
+        # layer.intermediate_size_per_partition = intermediate_size_per_partition
+        # layer.hidden_size = hidden_size
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
 
         assert hidden_size % self.packed_factor == 0, (
             f"Hidden size ({hidden_size}) must be divisible by packed factor "
             f"({self.packed_factor}).")
-        assert intermediate_size % self.packed_factor == 0, (
-            f"Intermediate size ({intermediate_size}) must be divisible by "
+        assert intermediate_size_per_partition % self.packed_factor == 0, (
+            f"Intermediate size ({intermediate_size_per_partition}) must be divisible by "
             f"packed factor ({self.packed_factor}).")
 
-        # W13 weight: [num_experts, 2 * intermediate_size, hidden_size]
-        # Contracting dim is hidden_size (dim 2)
-        layer.register_parameter(
-            "w13_weight_packed",
-            PackedvLLMParameter(
-                data=torch.empty(num_experts,
-                                 2 * intermediate_size,
-                                 hidden_size // self.packed_factor,
-                                 dtype=torch.int32),
-                input_dim=2,
-                output_dim=1,
-                packed_dim=2,
-                packed_factor=self.packed_factor,
-                weight_loader=weight_loader,
-            ))
+        # storage type, pack 8xint4 into int32
+        params_dtype = torch.int32
 
-        # W2 weight: [num_experts, hidden_size, intermediate_size]
-        # Contracting dim is intermediate_size (dim 2)
-        layer.register_parameter(
-            "w2_weight_packed",
-            PackedvLLMParameter(
-                data=torch.empty(num_experts,
-                                 hidden_size,
-                                 intermediate_size // self.packed_factor,
-                                 dtype=torch.int32),
-                input_dim=1,
-                output_dim=2,
-                packed_dim=2,
-                packed_factor=self.packed_factor,
-                weight_loader=weight_loader,
-            ))
-
-        # SHAPE PARAMETERS (logical shapes)
-        layer.register_parameter(
-            "w13_weight_shape",
-            BasevLLMParameter(data=torch.tensor(
-                [num_experts, 2 * intermediate_size, hidden_size],
-                dtype=torch.int64),
-                              weight_loader=weight_loader))
-        layer.register_parameter(
-            "w2_weight_shape",
-            BasevLLMParameter(data=torch.tensor(
-                [num_experts, hidden_size, intermediate_size],
-                dtype=torch.int64),
-                              weight_loader=weight_loader))
-
-        # SCALES
-        # Determine if we use grouped or channelwise scales
-        use_group_scales = (self.weight_quant.strategy == "group"
-                            and self.group_size != -1)
-
-        w13_scale_args = {
-            "data":
+        # WEIGHTS
+        w13_weight_packed = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size,
-                (hidden_size // self.group_size if use_group_scales else 1),
-                dtype=params_dtype),
-            "weight_loader":
-            weight_loader,
-        }
-        if use_group_scales:
-            layer.register_parameter(
-                "w13_weight_scale",
-                GroupQuantScaleParameter(output_dim=1,
-                                         input_dim=2,
-                                         **w13_scale_args))
-        else:
-            layer.register_parameter(
-                "w13_weight_scale",
-                ChannelQuantScaleParameter(output_dim=1, **w13_scale_args))
+                2 * intermediate_size_per_partition,
+                hidden_size // self.packed_factor,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_packed", w13_weight_packed)
+        set_weight_attrs(w13_weight_packed, extra_weight_attrs)
 
-        # w2_weight_scale
-        w2_scale_args = {
-            "data":
-            torch.empty(num_experts,
-                        hidden_size,
-                        (intermediate_size //
-                         self.group_size if use_group_scales else 1),
-                        dtype=params_dtype),
-            "weight_loader":
-            weight_loader,
-        }
-        if use_group_scales:
-            layer.register_parameter(
-                "w2_weight_scale",
-                GroupQuantScaleParameter(output_dim=1,
-                                         input_dim=2,
-                                         **w2_scale_args))
-        else:
-            layer.register_parameter(
-                "w2_weight_scale",
-                ChannelQuantScaleParameter(output_dim=1, **w2_scale_args))
+        w2_weight_packed = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.packed_factor,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_packed", w2_weight_packed)
+        set_weight_attrs(w2_weight_packed, extra_weight_attrs)
 
-        # Optional BIAS
-        if self.moe.has_bias:
-            layer.register_parameter(
-                "w13_bias",
-                BasevLLMParameter(data=torch.empty(num_experts,
-                                                   2 * intermediate_size,
-                                                   dtype=params_dtype),
-                                  weight_loader=weight_loader))
-            layer.register_parameter(
-                "w2_bias",
-                BasevLLMParameter(data=torch.empty(num_experts,
-                                                   hidden_size,
-                                                   dtype=params_dtype),
-                                  weight_loader=weight_loader))
+        # SCALES
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=layer.orig_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # We don't use input scales
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=layer.orig_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        # Add PER-GROUP quantization for FusedMoE.weight_loader.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value})
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # weight shapes
+        w2_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2),
+                                             requires_grad=False)
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
+        w13_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2),
+                                              requires_grad=False)
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        # don't use input scales
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
@@ -469,7 +430,7 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
                                                               packed_dim=2)
 
             # compressed-tensors uint4 is offset by 8 (0-15 -> -8 to 7)
-            return (unpacked - 8).astype(jnp.float8_e4m3fn)
+            return (unpacked - 8).astype(jnp.int4)
 
         # N.B
         # layer.w13_weight: [num_experts, 2*moe_intermediate_size, hidden_size]
@@ -489,7 +450,7 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
             w13_bias = w2_bias = None
 
         @jax.jit
-        def process_fp8_moe_weights(
+        def process_fp4_moe_weights(
             w13_weight: jax.Array,
             w13_weight_scale: jax.Array,
             w13_bias: jax.Array | None,
@@ -515,7 +476,7 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
                 w13_interleave=w13_interleave,
             )
 
-        weights = process_fp8_moe_weights(
+        weights = process_fp4_moe_weights(
             w13_weight,
             w13_weight_scale,
             w13_bias,
@@ -548,13 +509,40 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
         if hasattr(layer, "w2_weight_shape"):
             delattr(layer, "w2_weight_shape")
 
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+
+    def get_fused_moe_quant_config(
+            self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
+        # Store quantization scales; both per-group and per-channel
+        # Note we haven't specified the group size here because
+        # the quant config logic assumes group-wise scaling
+        # and channel-wise scaling are exclusive.
+        return FusedMoEQuantConfig.make(
+            self.moe.in_dtype,  # quant dtype for activations
+            w1_scale=layer.w13_weight_scale,  # group scale
+            w2_scale=layer.w2_weight_scale,  # group scale
+            # g1_alphas=layer.w13_weight_chan_scale,
+            # g2_alphas=layer.w2_weight_chan_scale,
+            per_act_token_quant=True,  # always use dynamic per-token
+            per_out_ch_quant=True,  # always use per-channel
+            block_shape=None,
+            weight_dtype="int4",  # weight dtype for weights
+        )
+        # return int4_w4afp8_moe_quant_config(
+        #     w1_scale=layer.w13_weight_scale,  # group scale
+        #     w2_scale=layer.w2_weight_scale,  # group scale
+        #     g1_alphas=layer.w13_weight_chan_scale,
+        #     g2_alphas=layer.w2_weight_chan_scale,
+        #     per_act_token_quant=True,  # always use dynamic per-token
+        #     per_out_ch_quant=True,  # always use per-channel
+        # )
+
     def apply_monolithic(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-
         weights = FusedMoEWeights(
             w13_weight=jax_view(layer.w13_weight).astype(jnp.int4),
             w13_weight_scale=jax_view(layer.w13_weight_scale),
@@ -568,3 +556,20 @@ class VllmCompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsW4A8Fp8MoEMethod,
                               quant_method_instance=self,
                               x=x,
                               router_logits=router_logits)
+
+
+class VllmCompressedTensorsW4A16MoEMethod(
+        VllmCompressedTensorsW4A8Fp8MoEMethod, VllmQuantConfig):
+    """
+    MoE method for int4xfp8 (INT4 weights, FP8 activations).
+    """
+
+    def get_fused_moe_quant_config(
+            self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
+        return int4_w4a16_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_zp=None,
+            w2_zp=None,
+            block_shape=[0, self.group_size],
+        )

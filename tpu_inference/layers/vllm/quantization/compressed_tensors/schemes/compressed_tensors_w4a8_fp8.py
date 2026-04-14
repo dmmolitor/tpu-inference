@@ -86,6 +86,7 @@ class VllmCompressedTensorsW4A8Fp8(CompressedTensorsW4A8Fp8):
         self.out_dtype = torch.get_default_dtype()
         self.is_static_input_scheme = is_static_input_scheme
         self.weight_block_size = self.weight_quant.block_structure
+        self.x_q_dtype = jnp.float8_e4m3fn
 
         self.linear_config = linear_config
 
@@ -253,7 +254,7 @@ class VllmCompressedTensorsW4A8Fp8(CompressedTensorsW4A8Fp8):
                                         weight_scale_jax,
                                         self.linear_config.weight_sharding,
                                         mesh=self.linear_config.mesh,
-                                        x_q_dtype=jnp.float8_e4m3fn)
+                                        x_q_dtype=self.x_q_dtype)
 
         if bias is not None and not layer.skip_bias_add:
             outs += jax_view(bias)
@@ -278,7 +279,7 @@ class VllmCompressedTensorsW4A8Fp8(CompressedTensorsW4A8Fp8):
                 weight_scale_jax,
                 self.linear_config.weight_sharding,
                 mesh=self.linear_config.mesh,
-                x_q_dtype=jnp.float8_e4m3fn,
+                x_q_dtype=self.x_q_dtype,
                 acc_dtype=jnp.float32,
             )
 
@@ -286,3 +287,18 @@ class VllmCompressedTensorsW4A8Fp8(CompressedTensorsW4A8Fp8):
                 out += jax_view(bias[i])
             outs.append(out)
         return torch_view(jnp.concatenate(outs, axis=-1))
+
+
+class VllmCompressedTensorsW4A16(VllmCompressedTensorsW4A8Fp8):
+
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        linear_config: VllmQuantLinearConfig,
+    ):
+        super().__init__(
+            weight_quant=weight_quant,
+            is_static_input_scheme=False,
+            linear_config=linear_config,
+        )
+        self.x_q_dtype = jnp.bfloat16

@@ -43,8 +43,8 @@ from tests.layers.common import utils as test_utils
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
     VllmCompressedTensorsConfig
-from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_fp8 import \
-    VllmCompressedTensorsW4A8Fp8
+from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_fp8 import (
+    VllmCompressedTensorsW4A8Fp8, VllmCompressedTensorsW4A16)
 from tpu_inference.layers.vllm.quantization.configs import \
     VllmQuantLinearConfig
 
@@ -135,7 +135,9 @@ def initialize_layer_weights(layer: torch.nn.Module) -> torch.Tensor:
     return weight_ref
 
 
-def return_ref_and_layer_output(layer: torch.nn.Module, batch_size: int = 16):
+def return_ref_and_layer_output(layer: torch.nn.Module,
+                                batch_size: int = 16,
+                                quantize_input: bool = True):
 
     weight_ref = initialize_layer_weights(layer)
     assert isinstance(layer, LinearBase)
@@ -151,7 +153,12 @@ def return_ref_and_layer_output(layer: torch.nn.Module, batch_size: int = 16):
     input_tensor = input_tensor.to('cpu')
 
     # Run reference implementation
-    ref_output = ref_w4a8_fp8_dynamic(input_tensor, weight_ref, layer.bias)
+    if quantize_input:
+        ref_output = ref_w4a8_fp8_dynamic(input_tensor, weight_ref, layer.bias)
+    else:
+        ref_output = torch.einsum('bd,fd->bf', input_tensor, weight_ref)
+        if layer.bias is not None:
+            ref_output += layer.bias
 
     # Run torchax/jax function
     with torchax.default_env():
@@ -412,6 +419,201 @@ def test_merged_column_parallel_linear(model, bias, num_devices, fuse_matmuls,
 
     # Add activation quantization since the test checkpoints use w4a16 quant.
     override_activation_quant_config(vllm_config, num_bits=8, strategy="token")
+
+    # Call tpu_inference code
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = MergedColumnParallelLinear(
+            input_size=4096,
+            output_sizes=[14336] * 2,
+            bias=bias,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+        linear_layer.quant_method.fuse_matmuls = fuse_matmuls
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("mesh", [
+    test_utils.get_spmd_mesh(1),
+    test_utils.get_spmd_mesh(min(4, jax.local_device_count()))
+])
+@pytest.mark.parametrize("model", MODELS)
+def test_loading_model_w416(model, mesh):
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    vllm_config.quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    vllm_config.device_config.device = "cpu"
+
+    with set_current_vllm_config(vllm_config):
+        vllm_model = vllm_get_model(vllm_config=vllm_config)
+    layers = test_utils.find_all_layer_type(vllm_model, LinearBase)
+    for layer in layers:
+        assert isinstance(layer.quant_config, VllmCompressedTensorsConfig)
+        assert isinstance(layer.quant_method, CompressedTensorsLinearMethod)
+        assert isinstance(layer.scheme, VllmCompressedTensorsW4A16)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("num_devices", [1, min(4, jax.local_device_count())])
+@pytest.mark.parametrize("enable_sp", [False, True])
+@pytest.mark.parametrize("enable_attn_dp", [False, True])
+@pytest.mark.parametrize("model", MODELS)
+def test_row_parallel_linear_w416(model, bias, num_devices, enable_sp,
+                                  enable_attn_dp):
+    # Skip if enable_attn_dp is True but we don't have enough devices
+    if enable_attn_dp and num_devices < 2:
+        pytest.skip("enable_attn_dp requires at least 2 devices")
+
+    mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
+
+    # Call tpu_inference code
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = RowParallelLinear(
+            input_size=4096,
+            output_size=8192,
+            bias=bias,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("num_devices", [1, min(4, jax.local_device_count())])
+@pytest.mark.parametrize("enable_sp", [False, True])
+@pytest.mark.parametrize("enable_attn_dp", [False, True])
+@pytest.mark.parametrize("model", MODELS)
+def test_column_parallel_linear_w416(model, bias, num_devices, enable_sp,
+                                     enable_attn_dp):
+    # Skip if enable_attn_dp is True but we don't have enough devices
+    if enable_attn_dp and num_devices < 2:
+        pytest.skip("enable_attn_dp requires at least 2 devices")
+
+    mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
+
+    # Call tpu_inference code
+    vllm_config.model_config.dtype = torch.bfloat16
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = ColumnParallelLinear(
+            input_size=4096,
+            output_size=8192,
+            bias=bias,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("num_devices", [1, min(4, jax.local_device_count())])
+@pytest.mark.parametrize("enable_sp", [False, True])
+@pytest.mark.parametrize("fuse_matmuls", [False, True])
+@pytest.mark.parametrize("enable_attn_dp", [False, True])
+@pytest.mark.parametrize("model", MODELS)
+def test_qkv_parallel_linear_w416(model, bias, num_devices, enable_sp,
+                                  fuse_matmuls, enable_attn_dp):
+    # Skip if enable_attn_dp is True but we don't have enough devices
+    if enable_attn_dp and num_devices < 2:
+        pytest.skip("enable_attn_dp requires at least 2 devices")
+
+    mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
+
+    # Call tpu_inference code
+    vllm_config.model_config.dtype = torch.bfloat16
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = QKVParallelLinear(
+            hidden_size=4096,
+            head_size=128,
+            total_num_heads=32,
+            total_num_kv_heads=8,
+            bias=bias,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+        linear_layer.quant_method.fuse_matmuls = fuse_matmuls
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("num_devices", [1, min(4, jax.local_device_count())])
+@pytest.mark.parametrize("fuse_matmuls", [False, True])
+@pytest.mark.parametrize("enable_sp", [False, True])
+@pytest.mark.parametrize("enable_attn_dp", [False, True])
+@pytest.mark.parametrize("model", MODELS)
+def test_merged_column_parallel_linear_w416(model, bias, num_devices,
+                                            fuse_matmuls, enable_sp,
+                                            enable_attn_dp):
+    # Skip if enable_attn_dp is True but we don't have enough devices
+    if enable_attn_dp and num_devices < 2:
+        pytest.skip("enable_attn_dp requires at least 2 devices")
+
+    mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.compilation_config.pass_config.enable_sp = enable_sp
 
     # Call tpu_inference code
     vllm_config.model_config.dtype = dtype

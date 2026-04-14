@@ -15,6 +15,7 @@
 from typing import Optional
 
 import torch
+from compressed_tensors.quantization import QuantizationArgs
 from jax.sharding import PartitionSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -32,8 +33,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 from tpu_inference.layers.common.quant_methods import COMPRESSED_TENSORS
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe import \
     VllmCompressedTensorsMoEMethod
-from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_fp8 import \
-    VllmCompressedTensorsW4A8Fp8
+from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_fp8 import (
+    VllmCompressedTensorsW4A8Fp8, VllmCompressedTensorsW4A16)
 from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import \
     VllmCompressedTensorsW8A8Fp8
 from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
@@ -45,6 +46,14 @@ from tpu_inference.logger import init_logger
 
 P = PartitionSpec
 logger = init_logger(__name__)
+
+
+def _is_w4_a16(weight_quant: QuantizationArgs,
+               input_quant: QuantizationArgs) -> bool:
+    if not weight_quant:
+        return False
+    return (weight_quant.num_bits == 4 and weight_quant.symmetric
+            and (not input_quant or input_quant.num_bits == 16))
 
 
 @register_quantization_config(COMPRESSED_TENSORS)
@@ -94,6 +103,12 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         # TODO(kyuyeunk): Add support for different act_quant_format
 
         linear_config = self.get_linear_config(layer)
+
+        if _is_w4_a16(weight_quant, input_quant):
+            return VllmCompressedTensorsW4A16(
+                weight_quant=weight_quant,
+                linear_config=linear_config,
+            )
 
         if self._is_fp8_w4a8(weight_quant, input_quant):
             return VllmCompressedTensorsW4A8Fp8(

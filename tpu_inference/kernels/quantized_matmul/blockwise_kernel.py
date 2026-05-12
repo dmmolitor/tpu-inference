@@ -75,6 +75,14 @@ def quantized_matmul_kernel(
     # The num_blocks should become 1 in case of channelwise.
     block_size = tuned_value.in_block_size if block_size == orig_n_in else block_size
 
+    # Ensure block sizes are compatible with architectural and kernel loop constraints.
+    # n_lane_multiplier > 1 could improve perf by reducing loop overhead and increasing instruction-level parallelism,
+    # allowing the compiler to overlap output fusion and packing overhead with MXU computation
+    # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
+    compute_tile_n = MXU_SIZE * n_lane_multiplier
+    out_block_size = next_multiple(out_block_size, compute_tile_n)
+    in_block_size = next_multiple(in_block_size, block_size)
+
     # Pad the inputs to be multiple of block size.
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
     if orig_n_batch < padded_n_batch:
@@ -127,11 +135,7 @@ def quantized_matmul_kernel(
         upper_limit_bytes=get_device_vmem_limit(),
     )
 
-    steps_k = in_block_size // block_size
-    # n_lane_multiplier > 1 could improve perf by reducing loop overhead and increasing instruction-level parallelism,
-    # allowing the compiler to overlap output fusion and packing overhead with MXU computation
-    # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
-    compute_tile_n = MXU_SIZE * n_lane_multiplier
+    steps_k = min(1, in_block_size // block_size)
     steps_n = max(1, out_block_size // compute_tile_n)
 
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):

@@ -14,6 +14,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.interface import PauseState
@@ -21,6 +22,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.request import Request
 
 from tpu_inference.core.sched.dp_scheduler import (
@@ -198,10 +200,10 @@ class TestDPScheduler:
 
                     assert scheduler.dp_size == 2
 
-    def test_get_rank_token_counts(self, mock_vllm_config,
-                                   mock_kv_cache_config,
-                                   mock_structured_output_manager):
-        """Test _get_rank_token_counts queries workers and aggregates tokens."""
+    def test_get_rank_pending_prefill_tokens(self, mock_vllm_config,
+                                             mock_kv_cache_config,
+                                             mock_structured_output_manager):
+        """Test _get_rank_pending_prefill_tokens queries workers and aggregates tokens."""
         scheduler = self._create_scheduler(mock_vllm_config,
                                            mock_kv_cache_config,
                                            mock_structured_output_manager)
@@ -210,19 +212,19 @@ class TestDPScheduler:
         scheduler._send_command = MagicMock()
         scheduler._get_result = MagicMock(side_effect=[30, 15])
 
-        rank_tokens = scheduler._get_rank_token_counts()
+        rank_tokens = scheduler._get_rank_pending_prefill_tokens()
 
         # Verify correct commands were sent
         scheduler._send_command.assert_any_call(
-            0, SchedulerCommand.GET_TOKEN_COUNT)
+            0, SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
         scheduler._send_command.assert_any_call(
-            1, SchedulerCommand.GET_TOKEN_COUNT)
+            1, SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
 
         # Verify results were collected
-        scheduler._get_result.assert_any_call(0,
-                                              SchedulerCommand.GET_TOKEN_COUNT)
-        scheduler._get_result.assert_any_call(1,
-                                              SchedulerCommand.GET_TOKEN_COUNT)
+        scheduler._get_result.assert_any_call(
+            0, SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
+        scheduler._get_result.assert_any_call(
+            1, SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
 
         assert rank_tokens[0] == 30
         assert rank_tokens[1] == 15
@@ -231,19 +233,17 @@ class TestDPScheduler:
                                            mock_kv_cache_config,
                                            mock_structured_output_manager):
         """Test _find_best_rank_for_request prefers cache hits."""
+        # Enable prefix caching to exercise the cache-hit path
+        mock_vllm_config.cache_config.enable_prefix_caching = True
         scheduler = self._create_scheduler(mock_vllm_config,
                                            mock_kv_cache_config,
                                            mock_structured_output_manager)
 
         mock_request = MagicMock(spec=Request)
 
-        # Mock _send_command and _get_result
-        # _get_rank_token_counts calls _get_result for GET_TOKEN_COUNT (2 ranks)
-        # then _find_best_rank calls _get_result for PROBE_COMPUTED_BLOCKS (2 ranks)
+        # Mock _send_command and _get_result for PROBE_COMPUTED_BLOCKS (2 ranks)
         scheduler._send_command = MagicMock()
         scheduler._get_result = MagicMock(side_effect=[
-            100,
-            50,  # GET_TOKEN_COUNT: rank 0=100, rank 1=50
             10,
             25,  # PROBE_COMPUTED_BLOCKS: rank 0=10, rank 1=25
         ])
@@ -256,25 +256,22 @@ class TestDPScheduler:
     def test_find_best_rank_without_cache_hit(self, mock_vllm_config,
                                               mock_kv_cache_config,
                                               mock_structured_output_manager):
-        """Test _find_best_rank_for_request uses load balancing without cache hit."""
+        """Test _find_best_rank_for_request uses pending prefill token counts."""
         scheduler = self._create_scheduler(mock_vllm_config,
                                            mock_kv_cache_config,
                                            mock_structured_output_manager)
 
         mock_request = MagicMock(spec=Request)
 
-        # Mock _send_command and _get_result
-        scheduler._send_command = MagicMock()
-        scheduler._get_result = MagicMock(side_effect=[
-            100,
-            50,  # GET_TOKEN_COUNT: rank 0=100, rank 1=50
-            0,
-            0,  # PROBE_COMPUTED_BLOCKS: no cache hits
-        ])
+        # Simulate rank 0 having more pending prefill tokens than rank 1
+        scheduler._get_rank_pending_prefill_tokens = MagicMock(return_value={
+            0: 100,
+            1: 50
+        })
 
         rank = scheduler._find_best_rank_for_request(mock_request)
 
-        # Should choose rank with fewer tokens (rank 1)
+        # Should choose rank with fewer pending prefill tokens (rank 1)
         assert rank == 1
 
     def test_add_request_assigns_to_best_rank(self, mock_vllm_config,
@@ -285,8 +282,12 @@ class TestDPScheduler:
                                            mock_kv_cache_config,
                                            mock_structured_output_manager)
 
+        # Disable batch prefills so add_request routes immediately
+        scheduler._batch_prefills = False
+
         mock_request = MagicMock(spec=Request)
         mock_request.request_id = "req1"
+        mock_request.num_tokens = 512
 
         # Mock _find_best_rank_for_request to return rank 1
         scheduler._find_best_rank_for_request = MagicMock(return_value=1)
@@ -351,10 +352,10 @@ class TestDPScheduler:
         mock_output_1.scheduled_encoder_inputs = {}
         mock_output_1.num_common_prefix_blocks = []
 
-        # Mock _send_command and _get_result
+        # Mock _send_command and _collect_results_unordered
         scheduler._send_command = MagicMock()
-        scheduler._get_result = MagicMock(
-            side_effect=[mock_output_0, mock_output_1])
+        scheduler._collect_results_unordered = MagicMock(
+            return_value=[mock_output_0, mock_output_1])
 
         # Setup assigned ranks
         scheduler.assigned_dp_rank = {"req1": 0, "req2": 1}
@@ -371,6 +372,9 @@ class TestDPScheduler:
         assert "req1" in output.num_scheduled_tokens
         assert "req2" in output.num_scheduled_tokens
         assert output.assigned_dp_rank == {"req1": 0, "req2": 1}
+
+        # Verify new per-rank fields
+        assert output.req_ids_per_rank == {0: ["req1"], 1: ["req2"]}
 
     def test_combine_cached_request_data(self, mock_vllm_config,
                                          mock_kv_cache_config,
@@ -744,6 +748,210 @@ class TestDPScheduler:
         combined = scheduler._combine_scheduler_outputs([output_0, output_1])
 
         assert combined.total_num_scheduled_tokens == 30
+
+        # Verify new per-rank fields
+        assert combined.req_ids_per_rank == {0: ["req1"], 1: ["req2"]}
+
+    def test_split_model_output_by_rank(self, mock_vllm_config,
+                                        mock_kv_cache_config,
+                                        mock_structured_output_manager):
+        """Test _split_model_output_by_rank correctly splits outputs using scheduler_output."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+
+        scheduler.assigned_dp_rank = {"req1": 0, "req2": 1, "req3": 0}
+
+        scheduler_output = DPSchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[],
+                resumed_req_ids=[],
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[],
+                num_computed_tokens=[],
+                num_output_tokens=[],
+            ),
+            num_scheduled_tokens={
+                "req1": 5,
+                "req2": 10,
+                "req3": 3
+            },
+            total_num_scheduled_tokens=18,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=set(),
+            assigned_dp_rank={
+                "req1": 0,
+                "req2": 1,
+                "req3": 0
+            },
+            max_num_scheduled_tokens_per_dp_rank=10,
+            req_ids_per_rank={
+                0: ["req1", "req3"],
+                1: ["req2"]
+            },
+        )
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=["req1", "req2", "req3"],
+            req_id_to_index={
+                "req1": 0,
+                "req2": 1,
+                "req3": 2
+            },
+            sampled_token_ids=[[42], [99], [77]],
+            logprobs=None,
+            prompt_logprobs_dict={"req2": MagicMock()},
+            pooler_output=None,
+            num_nans_in_logits=None,
+            kv_connector_output=MagicMock(),
+        )
+
+        outputs = scheduler._split_model_output_by_rank(
+            scheduler_output, model_runner_output)
+
+        assert len(outputs) == 2
+
+        # Rank 0 should have req1, req3
+        assert outputs[0].req_ids == ["req1", "req3"]
+        assert outputs[0].req_id_to_index == {"req1": 0, "req3": 1}
+        assert outputs[0].sampled_token_ids == [[42], [77]]
+
+        # Rank 1 should have req2
+        assert outputs[1].req_ids == ["req2"]
+        assert outputs[1].req_id_to_index == {"req2": 0}
+        assert outputs[1].sampled_token_ids == [[99]]
+        assert "req2" in outputs[1].prompt_logprobs_dict
+
+    def test_split_model_output_by_rank_with_logprobs(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """Test _split_model_output_by_rank correctly slices logprobs."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+
+        scheduler.assigned_dp_rank = {"req1": 0, "req2": 1}
+
+        scheduler_output = DPSchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[],
+                resumed_req_ids=[],
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[],
+                num_computed_tokens=[],
+                num_output_tokens=[],
+            ),
+            num_scheduled_tokens={
+                "req1": 5,
+                "req2": 10
+            },
+            total_num_scheduled_tokens=15,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=set(),
+            assigned_dp_rank={
+                "req1": 0,
+                "req2": 1
+            },
+            max_num_scheduled_tokens_per_dp_rank=10,
+            req_ids_per_rank={
+                0: ["req1"],
+                1: ["req2"]
+            },
+        )
+
+        # Create logprobs without cu_num_generated_tokens (direct indexing)
+        logprobs = LogprobsLists(
+            logprob_token_ids=np.array([[10, 20], [30, 40]]),
+            logprobs=np.array([[0.1, 0.2], [0.3, 0.4]]),
+            sampled_token_ranks=np.array([1, 2]),
+            cu_num_generated_tokens=None,
+        )
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=["req1", "req2"],
+            req_id_to_index={
+                "req1": 0,
+                "req2": 1
+            },
+            sampled_token_ids=[[42], [99]],
+            logprobs=logprobs,
+            prompt_logprobs_dict={},
+            pooler_output=None,
+            num_nans_in_logits=None,
+            kv_connector_output=None,
+        )
+
+        outputs = scheduler._split_model_output_by_rank(
+            scheduler_output, model_runner_output)
+
+        # Rank 0 (req1 at global index 0)
+        assert outputs[0].logprobs is not None
+        np.testing.assert_array_equal(outputs[0].logprobs.logprob_token_ids,
+                                      np.array([[10, 20]]))
+        np.testing.assert_array_equal(outputs[0].logprobs.sampled_token_ranks,
+                                      np.array([1]))
+
+        # Rank 1 (req2 at global index 1)
+        assert outputs[1].logprobs is not None
+        np.testing.assert_array_equal(outputs[1].logprobs.logprob_token_ids,
+                                      np.array([[30, 40]]))
+        np.testing.assert_array_equal(outputs[1].logprobs.sampled_token_ranks,
+                                      np.array([2]))
+
+    def test_slice_logprobs_without_cumulative(self, mock_vllm_config,
+                                               mock_kv_cache_config,
+                                               mock_structured_output_manager):
+        """Test _slice_logprobs with direct indexing (no cu_num_generated_tokens)."""
+        logprobs = LogprobsLists(
+            logprob_token_ids=np.array([[10, 20], [30, 40], [50, 60]]),
+            logprobs=np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
+            sampled_token_ranks=np.array([1, 2, 3]),
+            cu_num_generated_tokens=None,
+        )
+
+        sliced = DPScheduler._slice_logprobs(logprobs, [0, 2])
+
+        np.testing.assert_array_equal(sliced.logprob_token_ids,
+                                      np.array([[10, 20], [50, 60]]))
+        np.testing.assert_array_equal(sliced.logprobs,
+                                      np.array([[0.1, 0.2], [0.5, 0.6]]))
+        np.testing.assert_array_equal(sliced.sampled_token_ranks,
+                                      np.array([1, 3]))
+        assert sliced.cu_num_generated_tokens is None
+
+    def test_slice_logprobs_with_cumulative(self, mock_vllm_config,
+                                            mock_kv_cache_config,
+                                            mock_structured_output_manager):
+        """Test _slice_logprobs with variable-length cu_num_generated_tokens."""
+        # req0 has 2 tokens, req1 has 3 tokens, req2 has 1 token
+        logprobs = LogprobsLists(
+            logprob_token_ids=np.array([[10, 20], [11, 21], [30, 40], [31, 41],
+                                        [32, 42], [50, 60]]),
+            logprobs=np.array([[0.1, 0.2], [0.11, 0.21], [0.3, 0.4],
+                               [0.31, 0.41], [0.32, 0.42], [0.5, 0.6]]),
+            sampled_token_ranks=np.array([1, 2, 3, 4, 5, 6]),
+            cu_num_generated_tokens=[0, 2, 5],
+        )
+
+        # Select req0 and req2 (skip req1)
+        sliced = DPScheduler._slice_logprobs(logprobs, [0, 2])
+
+        # req0: rows 0-1, req2: rows 5-5 (last element)
+        np.testing.assert_array_equal(sliced.logprob_token_ids,
+                                      np.array([[10, 20], [11, 21], [50, 60]]))
+        np.testing.assert_array_equal(sliced.sampled_token_ranks,
+                                      np.array([1, 2, 6]))
+        assert sliced.cu_num_generated_tokens == [0, 2, 3]
 
     def test_shutdown(self, mock_vllm_config, mock_kv_cache_config,
                       mock_structured_output_manager):

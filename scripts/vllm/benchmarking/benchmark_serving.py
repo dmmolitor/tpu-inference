@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import contextlib
 import gc
+import logging
 import random
 import time
 import warnings
@@ -60,6 +61,7 @@ from benchmark_dataset import (GPQADataset, MLPerfDataset, MMLUDataset,
 from benchmark_utils import (eval_benchmark_dataset_result,
                              sample_warmup_requests)
 
+logger = logging.getLogger(__name__)
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 
@@ -144,8 +146,9 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[BenchmarkMetrics, list[int], list[int]]:
     actual_output_lens: list[int] = []
+    actual_input_lens: list[int] = []
     total_input = 0
     completed = 0
     good_completed = 0
@@ -156,6 +159,7 @@ def calculate_metrics(
     e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
+            logger.debug(f"Prompt: {input_requests[i].prompt}\nOutput: {outputs[i].generated_text}")
             output_len = outputs[i].output_tokens
 
             if not output_len:
@@ -168,7 +172,12 @@ def calculate_metrics(
                     tokenizer(outputs[i].generated_text,
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
-            total_input += input_requests[i].prompt_len
+            # Prefer server-reported prompt_tokens (accounts for chat template
+            # and multimodal tokens); fall back to client-side prompt_len.
+            input_len = (outputs[i].prompt_tokens
+                         or input_requests[i].prompt_len)
+            actual_input_lens.append(input_len)
+            total_input += input_len
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -182,6 +191,7 @@ def calculate_metrics(
             completed += 1
         else:
             actual_output_lens.append(0)
+            actual_input_lens.append(0)
 
     if goodput_config_dict:
         valid_metrics = []
@@ -242,7 +252,7 @@ def calculate_metrics(
                              for p in selected_percentiles],
     )
 
-    return metrics, actual_output_lens
+    return metrics, actual_output_lens, actual_input_lens
 
 
 async def benchmark(
@@ -339,7 +349,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics, actual_output_lens, input_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -375,7 +385,7 @@ async def benchmark(
         metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
-        "input_lens": [output.input_request.prompt_len for output in outputs],
+        "input_lens": input_lens,
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
@@ -460,6 +470,11 @@ def parse_goodput(slo_pairs):
 
 
 def main(args: argparse.Namespace):
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -483,6 +498,13 @@ def main(args: argparse.Namespace):
         trust_remote_code=args.trust_remote_code,
     )
 
+    if args.dataset_name == "mmmu_pro":
+        message = (
+            "MMMU-Pro must use --backend vllm-chat "
+            "and should also use --endpoint=/v1/chat/completions."
+        )
+        assert args.backend == "vllm-chat", message
+
     if args.dataset_name is None:
         raise ValueError(
             "Please specify '--dataset-name' and the corresponding "
@@ -491,7 +513,7 @@ def main(args: argparse.Namespace):
     if args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
         # For the "sonnet" dataset, formatting depends on the backend.
-        if args.backend == "openai-chat":
+        if args.backend == "vllm-chat":
             input_requests = dataset.sample(
                 num_requests=args.num_prompts,
                 input_len=args.sonnet_input_len,
@@ -527,6 +549,7 @@ def main(args: argparse.Namespace):
                                     num_requests=args.num_prompts,
                                     input_len=args.mmlu_input_len,
                                     output_len=args.mmlu_output_len,
+                                    chat_template_system_prompt=args.chat_template_system_prompt,
                                     ),
             "mlperf":
             lambda: MLPerfDataset(random_seed=args.seed,
@@ -543,13 +566,13 @@ def main(args: argparse.Namespace):
                                     tokenizer=tokenizer,
                                     num_requests=args.num_prompts,
                                     output_len=args.gpqa_output_len,
+                                    chat_template_system_prompt=args.chat_template_system_prompt,
                                     ),
             "mmmu_pro":
             lambda: MMMUProDataset(
                 random_seed=args.seed,
                 dataset_path=args.dataset_path,
                 subset=args.mmmu_pro_subset,
-                use_chat_template=args.mmmu_pro_use_chat_template,
             ).sample(
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,
@@ -795,6 +818,12 @@ if __name__ == "__main__":
         default="benchmark-serving",
         help="Specify the prefix of request id.",
     )
+    parser.add_argument(
+        "--chat-template-system-prompt",
+        type=str,
+        default="Reasoning effort: high",
+        help="The system prompt to use when applying a chat template.",
+    )
 
     # group for dataset specific arguments
     mmlu_group = parser.add_argument_group("mmlu dataset options")
@@ -873,11 +902,6 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="Output length for each request. Default is 16 (single-letter answer).",
-    )
-    mmmu_pro_group.add_argument(
-        "--mmmu-pro-use-chat-template",
-        action="store_true",
-        help="Whether to format MMMU-Pro prompts using the tokenizer's chat template.",
     )
 
     sonnet_group = parser.add_argument_group("sonnet dataset options")
@@ -1000,6 +1024,11 @@ if __name__ == "__main__":
         default="sampled",
         choices=["none", "sampled", "full"],
         help="Whether to warmup first, and set the warmup mode",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Whether to print debug logs.",
     )
 
     args = parser.parse_args()

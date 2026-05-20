@@ -317,6 +317,7 @@ def _ragged_paged_attention_kernel_loop(
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     *,
     use_causal_mask: bool = True,
+    update_kv_cache: bool = True,  # KV-share: False = skip cache writes
     skip_kv_mask: bool = False,
     sm_scale: float,
     sliding_window: int | None = None,
@@ -452,13 +453,16 @@ def _ragged_paged_attention_kernel_loop(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(k.dtype)
 
-        s = jnp.matmul(q, k.T,
-                       preferred_element_type=jnp.float32).astype(out_dtype)
-        s *= sm_scale
+        s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32)
+
+        s_scale = sm_scale
         if k_scale is not None:
-            s *= k_scale
+            s_scale *= k_scale
         if q_scale is not None:
-            s *= q_scale
+            s_scale *= q_scale
+
+        s *= s_scale
+
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
@@ -491,6 +495,9 @@ def _ragged_paged_attention_kernel_loop(
             s = jnp.where(mask, s, mask_value)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
+
+        # if converting the type too early, there will be accuracy issue.
+        s_rowmax = s_rowmax.astype(out_dtype)
         m_prev = m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr
@@ -518,10 +525,12 @@ def _ragged_paged_attention_kernel_loop(
                                     128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
                                head_dim)
-        pv = jnp.matmul(p, v,
-                        preferred_element_type=jnp.float32).astype(out_dtype)
+        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+
         if v_scale is not None:
             pv *= v_scale
+        # if converting the type too early, there will be accuracy issue.
+        pv = pv.astype(out_dtype)
         o_prev = o_ref[...]
         o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
 
@@ -551,7 +560,16 @@ def _ragged_paged_attention_kernel_loop(
         q_len = q_end - q_start
 
         kv_left = kv_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if update_kv_cache:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        else:
+            # KV-share: source layer already wrote the full K/V for the
+            # current step into the (redirected) cache slot before this
+            # layer's call, so read everything from cache. The shared
+            # layer's input k,v is unused. Mirrors vllm-pytorch behavior
+            # where unified_attention reads from key_cache/value_cache
+            # only, regardless of the layer's own k,v projections.
+            kv_left_frm_cache = kv_left
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
@@ -961,10 +979,15 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                          update_sz)
+                # KV-share: skip the cache write when update_kv_cache=False
+                # so shared layers don't overwrite the source layer's slot.
+                if update_kv_cache:
+
+                    @pl.when(
+                        jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                                              update_sz)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -1520,7 +1543,7 @@ def get_default_block_sizes(
                 bkv_csz = min(min_bkv_sz_to_peak, max_kv)
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(2048, max_kv)
+                bkv_sz = min(2048, max_kv // 2)
                 bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case _:
@@ -1537,6 +1560,7 @@ def get_default_block_sizes(
 @jax.jit(
     static_argnames=(
         "use_causal_mask",
+        "update_kv_cache",
         "skip_kv_mask",
         "sm_scale",
         "sliding_window",
@@ -1571,6 +1595,7 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     *,
     use_causal_mask: bool = True,
+    update_kv_cache: bool = True,
     skip_kv_mask: bool = False,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1785,6 +1810,7 @@ def ragged_paged_attention(
             functools.partial(
                 _ragged_paged_attention_kernel,
                 use_causal_mask=use_causal_mask,
+                update_kv_cache=update_kv_cache,
                 skip_kv_mask=skip_kv_mask,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,

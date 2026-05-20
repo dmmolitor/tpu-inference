@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import random
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import jax.numpy as jnp
+import numpy
 import torch
 import vllm.envs as vllm_envs
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -90,7 +92,7 @@ class TpuPlatform(Platform):
     simple_compile_backend: str = "openxla"
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4"
+        "compressed-tensors", "awq", "fp8", "gpt_oss_mxfp4", "modelopt_fp4"
     ]
 
     additional_env_vars: list[str] = [
@@ -107,6 +109,7 @@ class TpuPlatform(Platform):
         "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "USE_JAX_PROFILER_SERVER",
         "JAX_PROFILER_SERVER_PORT",
+        "ENABLE_RS_KERNEL",
     ]
 
     @classmethod
@@ -194,6 +197,15 @@ class TpuPlatform(Platform):
             assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
                 "VLLM_ENABLE_V1_MULTIPROCESSING must be 0 when using Pathways(JAX_PLATFORMS=proxy)"
             )
+
+        if vllm_config.model_config and vllm_config.model_config.use_mla:
+            if not envs.NEW_MODEL_DESIGN or not vllm_config.additional_config.get(
+                    "sharding", {}).get("sharding_strategy", {}).get(
+                        "enable_dp_attention", False):
+                raise ValueError(
+                    "MLA models require both the NEW_MODEL_DESIGN=1 environment "
+                    "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
+                )
         cls._initialize_sharding_config(vllm_config)
 
         from vllm.config import CompilationMode
@@ -231,8 +243,8 @@ class TpuPlatform(Platform):
                             min_page_size,
                         )
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
-            logger.info(
-                f"Using KV cache block size: {cache_config.block_size}")
+            if envs.USE_BATCHED_RPA_KERNEL and cache_config.block_size < 256:
+                cache_config.block_size = 256
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -265,14 +277,22 @@ class TpuPlatform(Platform):
 
         if scheduler_config.is_multimodal_model and not \
             scheduler_config.disable_chunked_mm_input:
-            logger.warning("TPU does not support running Multimodal models"
-                           " without setting `--disable_chunked_mm_input`. "
-                           "Forcing --disable_chunked_mm_input.")
-            scheduler_config.disable_chunked_mm_input = True
+            logger.warning(
+                "TPU does not support running Multimodal models"
+                " without setting `--disable_chunked_mm_input`. "
+                "If you are serving a multimodal model, please explicitly add the "
+                "`--disable-chunked-mm-input` flag to your server command to avoid execution failures."
+            )
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
-            assert kv_transfer_config.kv_connector == "TPUConnector"
+            allowed = ("TPUConnector", "TPUConnectorHMA",
+                       "TPUOffloadConnector")
+            if kv_transfer_config.kv_connector not in allowed:
+                raise ValueError(
+                    f"Unsupported kv_connector "
+                    f"'{kv_transfer_config.kv_connector}' for the TPU "
+                    f"platform. Expected one of {allowed}.")
         # Late initialization to avoid circular import.
         from tpu_inference.core.sched.dp_scheduler import \
             update_vllm_config_for_dp_scheduler
@@ -282,6 +302,11 @@ class TpuPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         # TODO: TPU still sets block_size in check_and_update_config.
         # Move that logic here so block_size is chosen by the backend.
+        logger.info(f"Using cache_config.block_size: "
+                    f"{vllm_config.cache_config.block_size} "
+                    f"instead of overriding with _align_hybrid_block_size() "
+                    f"since we set mamba_page_size_padded in "
+                    f"kv_cache_manager.py")
         pass
 
     @classmethod
@@ -343,3 +368,8 @@ class TpuPlatform(Platform):
         on the TPU device(s).
         """
         return torch.device("cpu")
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        random.seed(seed)
+        numpy.random.seed(seed)
